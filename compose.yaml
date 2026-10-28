@@ -1,0 +1,126 @@
+name: distributed-observability
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    PYTHONPATH: /app
+    MYSQL_HOST: mysql
+    RABBITMQ_HOST: rabbitmq
+    RABBITMQ_INTERNAL_PORT: 5672
+  depends_on:
+    mysql: { condition: service_healthy }
+    rabbitmq: { condition: service_healthy }
+  networks: [observability]
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+    interval: 15s
+    timeout: 4s
+    retries: 5
+    start_period: 15s
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+    ports: ["127.0.0.1:${MYSQL_PORT:-13307}:3306"]
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./infrastructure/mysql/01-create-databases.sql:/docker-entrypoint-initdb.d/01-create-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 35s
+    networks: [observability]
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set RABBITMQ_DEFAULT_PASS in .env}
+    ports:
+      - "127.0.0.1:${RABBITMQ_PORT:-25672}:5672"
+      - "127.0.0.1:${RABBITMQ_MANAGEMENT_PORT:-25673}:15672"
+    volumes: [rabbitmq_data:/var/lib/rabbitmq]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 25s
+    networks: [observability]
+
+  gateway:
+    <<: *backend
+    command: ["uvicorn", "services.gateway.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports: ["127.0.0.1:${GATEWAY_PORT:-8080}:8000"]
+    depends_on:
+      ingestion: { condition: service_started }
+      trace-processor: { condition: service_started }
+      log-processor: { condition: service_started }
+      metrics: { condition: service_started }
+      rca: { condition: service_started }
+      query: { condition: service_started }
+
+  ingestion:
+    <<: *backend
+    command: ["uvicorn", "services.ingestion.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  trace-processor:
+    <<: *backend
+    command: ["sh", "-c", "python -m services.trace_processor.worker & uvicorn services.trace_processor.main:app --host 0.0.0.0 --port 8000"]
+
+  log-processor:
+    <<: *backend
+    command: ["sh", "-c", "python -m services.log_processor.consumer & uvicorn services.log_processor.main:app --host 0.0.0.0 --port 8000"]
+
+  metrics:
+    <<: *backend
+    command: ["sh", "-c", "python -m services.metrics.consumer & uvicorn services.metrics.main:app --host 0.0.0.0 --port 8000"]
+
+  rca:
+    <<: *backend
+    command: ["uvicorn", "services.rca.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  query:
+    <<: *backend
+    command: ["uvicorn", "services.query.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  order:
+    <<: *backend
+    command: ["uvicorn", "services.order.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  payment:
+    <<: *backend
+    command: ["uvicorn", "services.payment.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  notification:
+    <<: *backend
+    command: ["uvicorn", "services.notification.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    restart: unless-stopped
+    ports: ["127.0.0.1:${FRONTEND_PORT:-5173}:80"]
+    depends_on:
+      gateway: { condition: service_started }
+    networks: [observability]
+
+networks:
+  observability:
+    driver: bridge
+volumes:
+  mysql_data:
+  rabbitmq_data:
